@@ -186,7 +186,7 @@ class ScriptArguments:
 
 
 class RewardTrainer(Trainer):
-    def __init__(self, *args, adv_lambda = 0.0, categories=None, **kwargs):
+    def __init__(self, *args, adv_lambda = 0.6, categories=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.discriminator = Discriminator().to(self.args.device).float()  # Ensure float32
         self.optim_d = torch.optim.Adam(self.discriminator.parameters())

@@ -16,7 +16,7 @@ model.eval()
 
 rb = load_dataset("allenai/reward-bench-2", "default", split="test")
 
-print("\nSample raw scores (first 5 examples):")
+print("\nSample raw scores (first 50 examples):")
 def score_raw(text):
     if isinstance(text, (list, tuple)):
         text = text[-1]
@@ -33,7 +33,7 @@ def score_raw(text):
         logits = logits[0]
     return logits.item()
 
-samples = rb.select(range(5))
+samples = rb.select(range(50))
 for ex in samples:
     sc_chosen = score_raw(ex["chosen"])
     sc_rej    = [score_raw(r) for r in ex["rejected"]]

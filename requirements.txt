@@ -7,3 +7,5 @@ seaborn
 matplotlib
 wandb
 tf-keras 
+pandas
+numpy
