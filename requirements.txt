@@ -1,0 +1,9 @@
+accelerate
+deepspeed
+transformers
+trl
+torch
+seaborn
+matplotlib
+wandb
+tf-keras 
