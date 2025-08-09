@@ -186,7 +186,7 @@ class ScriptArguments:
 
 
 class RewardTrainer(Trainer):
-    def __init__(self, *args, adv_lambda = 0.6, categories=None, **kwargs):
+    def __init__(self, *args, adv_lambda = 0.0, categories=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.discriminator = Discriminator().to(self.args.device).float()  # Ensure float32
         self.optim_d = torch.optim.Adam(self.discriminator.parameters())
@@ -404,7 +404,7 @@ if __name__ == "__main__":
 
         return train_dataset, eval_dataset
 
-    train_dataset, eval_dataset = build_dataset(tokenizer, train_size=25000, eval_size=1000)
+    train_dataset, eval_dataset = build_dataset(tokenizer, train_size=200, eval_size=1000)
 
     training_args = TrainingArguments(
         output_dir=output_name,
@@ -534,9 +534,9 @@ if __name__ == "__main__":
 
 
     print("Saving last checkpoint of the model")
-    torch.distributed.barrier()
-    trainer.save_model(output_name + "/last_checkpoint")
-    tokenizer.save_pretrained(output_name + "/last_checkpoint")
+    #torch.distributed.barrier()
+    # trainer.save_model(output_name + "/last_checkpoint")
+    #tokenizer.save_pretrained(output_name + "/last_checkpoint")
 
     torch.distributed.barrier() 
 
@@ -565,8 +565,8 @@ if __name__ == "__main__":
         return out.cpu().item()
 
     # gpt generated plotting junk
-    chosen_scores   = np.array([get_reward_score(t) for t in train_dataset["text_j"]])
-    rejected_scores = np.array([get_reward_score(t) for t in train_dataset["text_k"]])
+    chosen_scores   = np.array([get_reward_score(t) for t in eval_dataset["text_j"]])
+    rejected_scores = np.array([get_reward_score(t) for t in eval_dataset["text_k"]])
 
     kde_chosen   = gaussian_kde(chosen_scores)
     kde_rejected = gaussian_kde(rejected_scores)
