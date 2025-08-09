@@ -17,11 +17,11 @@ rm -rf ~/.cache/torch_extensions
 # to add back, do     # --deepspeed deepspeed_config_2.json \
 accelerate launch rm_training.py \
     --deepspeed deepspeed_config.json \
-    --per_device_train_batch_size 16 \
-    --per_device_eval_batch_size 16 \
+    --per_device_train_batch_size 8 \
+    --per_device_eval_batch_size 8 \
     --max_length 2048 \
     --gradient_checkpointing \
-    --num_train_epochs 2 \
+    --num_train_epochs 1 \
     --learning_rate 3e-5 \
     --output_path ./models/llama3_rm_fair_deepspeed \
 
