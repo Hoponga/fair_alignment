@@ -15,7 +15,7 @@ rm -rf ~/.cache/torch_extensions
 
 # rn no deepspeed :( 
 # to add back, do     # --deepspeed deepspeed_config_2.json \
-accelerate launch rm_training.py \
+accelerate launch rm_training_corrected.py \
     --deepspeed deepspeed_config.json \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 8 \
