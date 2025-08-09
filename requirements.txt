@@ -9,3 +9,4 @@ wandb
 tf-keras 
 pandas
 numpy
+scikit-learn
