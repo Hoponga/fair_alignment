@@ -404,7 +404,7 @@ if __name__ == "__main__":
 
         return train_dataset, eval_dataset
 
-    train_dataset, eval_dataset = build_dataset(tokenizer, train_size=1500, eval_size=1000)
+    train_dataset, eval_dataset = build_dataset(tokenizer, train_size=25000, eval_size=1000)
 
     training_args = TrainingArguments(
         output_dir=output_name,
