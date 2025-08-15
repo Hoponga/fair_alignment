@@ -39,11 +39,14 @@ import torch.nn.functional as F
 from collections import deque
 
 
+
 import warnings
 warnings.filterwarnings(
     "ignore",
     message="MiniBatchKMeans is known to have a memory leak on Windows with MKL"
 )
+
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -52,11 +55,14 @@ def set_seed(seed: int):
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
 
+
 from transformers import TrainerCallback
 
 
 
 from transformers import PreTrainedTokenizer, PreTrainedModel
+
+
 
 def get_llm_embeddings(
     texts: List[str],
@@ -72,6 +78,7 @@ def get_llm_embeddings(
     tokenizer.model_max_length = model.config.n_positions
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     all_embs = []
     for i in range(0, len(texts), batch_size):
@@ -96,20 +103,27 @@ def get_llm_embeddings(
 from datasets import load_dataset, concatenate_datasets
 
 def load_hh_rlhf_with_category() -> "datasets.Dataset":
-    helpful = load_dataset(
-        "Anthropic/hh-rlhf",
-        data_dir="helpful-base",
-        split="train",
-    )
-    helpful = helpful.map(lambda _: {"category": "helpful"})
-    harmless = load_dataset(
-        "Anthropic/hh-rlhf",
-        data_dir="harmless-base",
-        split="train",
-    )
-    harmless = harmless.map(lambda _: {"category": "harmless"}) 
-    combined = concatenate_datasets([helpful, harmless]).shuffle(seed=42)
-    return combined
+
+    ds_helpful  = load_dataset("RLHFlow/HH-RLHF-Helpful-standard", split="train")
+    ds_helpful  = ds_helpful.map(lambda ex: {"category": "helpful"})
+    ds_harmless = load_dataset("RLHFlow/HH-RLHF-Harmless-and-RedTeam-standard", split="train")
+    ds_harmless = ds_harmless.map(lambda ex: {"category": "harmless"})
+    # helpful = load_dataset(
+    #     "Anthropic/hh-rlhf",
+    #     data_dir="helpful-base",
+    #     split="train",
+    # )
+    # helpful = helpful.map(lambda _: {"category": "helpful"})
+    # harmless = load_dataset(
+    #     "Anthropic/hh-rlhf",
+    #     data_dir="harmless-base",
+    #     split="train",
+    # )
+    # harmless = harmless.map(lambda _: {"category": "harmless"}) 
+    # combined = concatenate_datasets([helpful, harmless]).shuffle(seed=42)
+    ds_all = concatenate_datasets([ds_helpful, ds_harmless]).shuffle(seed=42)
+    return ds_all
+
 
 
 @dataclass
@@ -130,7 +144,7 @@ class ScriptArguments:
         weight_decay: Optional[float] = field(default=0.001)
 
         model_name: Optional[str] = field(
-            default="RLHFlow/LLaMA3-SFT",
+            default="meta-llama/Meta-Llama-3-8B-Instruct",
             #default="openai-community/gpt2",
             metadata={
                 "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
@@ -185,26 +199,47 @@ class ScriptArguments:
         )
 
 
+
 class RewardTrainer(Trainer):
-    def __init__(self, *args, adv_lambda = 0.0, categories=None, **kwargs):
+    def __init__(self, *args, adv_lambda = 0.2, categories=None, adv_lambda_warmup_steps = 1000, adv_lambda_k=5.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.discriminator = Discriminator().to(self.args.device).float()  # Ensure float32
         self.optim_d = torch.optim.Adam(self.discriminator.parameters())
         self.criterion_d = nn.CrossEntropyLoss()
         self.adv_lambda = adv_lambda
+        self.adv_lambda_k = adv_lambda_k
+        self.adv_lambda_warmup_steps = adv_lambda_warmup_steps
+        
 
         if categories is not None: 
             # create a dictionary mapping each category to an index 
             self.category_ids = {cat: i for i, cat in enumerate(categories)}
         else: 
             assert False, "categories must be provided"
+
+    def _get_current_adv_lambda(self):
+        """Exponential warmup that stays ~0 until late in warmup."""
+        step = max(0, self.state.global_step)
+        if self.adv_lambda_warmup_steps <= 0:
+            return self.adv_lambda
+        progress = min(1.0, step / self.adv_lambda_warmup_steps)
+        # Exponential curve: small early, rises sharply near the end
+        scaled = (math.exp(self.adv_lambda_k * progress) - 1) / (math.exp(self.adv_lambda_k) - 1)
+        return self.adv_lambda * scaled
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+
+        # print(f"CHOSEN SAMPLES: {inputs['texts_j']}")
+        # print("\n\n\n\n\n\n\n")
+        # print(f"REJECTED SAMPLES: {inputs['texts_k']}")
+        # print("\n\n\n\n\n\n\n")
         # normal bradley terry loss 
         rewards = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-        )[0]
+        )[0] # (batch_size,)
+        #print(rewards)
+
         bsz = rewards.size(0)
         jidx = torch.arange(0, bsz, 2, device=rewards.device)
         kidx = jidx + 1
@@ -223,7 +258,7 @@ class RewardTrainer(Trainer):
             if isinstance(feat, list):
                 feat = torch.cat(feat, dim=0)
             x = feat.detach().to(self.args.device).float()
-            logits = self.discriminator(x)
+            logits = self.discriminator(x.squeeze(-1))
             target = torch.tensor([self.category_ids[cat]], device=self.args.device)
             disc_loss += self.criterion_d(logits.unsqueeze(0), target)
         disc_loss.backward()
@@ -238,7 +273,7 @@ class RewardTrainer(Trainer):
             if isinstance(feat, list):
                 feat = torch.cat(feat, dim=0)
             x = feat.to(self.args.device).float()
-            logits = self.discriminator(x)
+            logits = self.discriminator(x.squeeze(-1))
             probs = logits.softmax(dim=-1)
             target = torch.tensor([self.category_ids[cat]], device = self.args.device)
             loss_adv -= self.criterion_d(logits.unsqueeze(0), target) # minimax loss 
@@ -247,17 +282,19 @@ class RewardTrainer(Trainer):
         for p in self.discriminator.parameters():
             p.requires_grad_(True)
 
-        total_loss = loss_bt + self.adv_lambda * (loss_adv / len(feats))
+        current_adv_lambda = self._get_current_adv_lambda()
+        total_loss = loss_bt + current_adv_lambda * (loss_adv / len(feats))
 
         self.accelerator.print(
             f"loss_bt={loss_bt.item():.4f}  "
             f"loss_adv={(loss_adv/len(feats)).item():.4f}"
+            f"adv_lambda={current_adv_lambda:.4f}"
         )
 
         if return_outputs:
             return total_loss, {"rewards_j": rewards_j, "rewards_k": rewards_k}
         return total_loss
-
+        
 
 
 # train a discriminator to predict the category of a reward model output 
@@ -313,6 +350,58 @@ def pairwise_moments(rew_pairs: torch.Tensor, cats: List[str], eps=1e-8):
     }
     return feat_dict 
 
+
+# chat template for llama3sft
+
+def render_with_template(prompt: str, answer: str) -> str:
+    msgs = [{"role":"user","content": prompt},
+            {"role":"assistant","content": answer}]
+    return tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=False
+    )
+
+
+import re
+
+def _anthropic_to_messages(s):
+    """Turn Anthropic HH string or list into [{'role','content'}, ...]."""
+    if isinstance(s, str):
+        # Split "Human:" / "Assistant:" transcript into turns
+        roles = re.findall(r'(Human|Assistant):', s)
+        parts = re.split(r'(?:Human|Assistant):', s)[1:]  # [content1, content2, ...]
+        msgs = []
+        for role, content in zip(roles, parts):
+            r = "user" if role == "Human" else "assistant"
+            msgs.append({"role": r, "content": content.strip()})
+        return msgs
+    elif isinstance(s, (list, tuple)):
+        msgs = []
+        for turn in s:
+            if isinstance(turn, dict) and "content" in turn:
+                role = turn.get("role", "user").lower()
+                if role in ("human", "user"): role = "user"
+                if role in ("assistant",):    role = "assistant"
+                msgs.append({"role": role, "content": str(turn["content"])})
+        return msgs
+    else:
+        return []
+
+def _split_prompt_answer(messages):
+    """Use the last assistant message as the answer; everything before is prompt."""
+    if not messages:
+        return "", ""
+    last_ass = max((i for i, m in enumerate(messages) if m["role"] == "assistant"), default=None)
+    if last_ass is None:
+        # no assistant; treat last as answer
+        prompt_msgs = messages[:-1]
+        answer = messages[-1]["content"]
+    else:
+        prompt_msgs = messages[:last_ass]
+        answer = messages[last_ass]["content"]
+    prompt = "\n".join(m["content"] for m in prompt_msgs) if prompt_msgs else ""
+    return prompt, answer
+
+
 if __name__ == "__main__":
     
     local_rank = int(os.environ.get('LOCAL_RANK'))
@@ -338,18 +427,20 @@ if __name__ == "__main__":
 
     tokenizer.truncation_side = "left"
     tokenizer.model_max_length = script_args.max_length
-    # tokenizer.padding_side = "right"
 
+    #tokenizer.padding_side = "right"
 
 
     model = AutoModelForSequenceClassification.from_pretrained(
         script_args.model_name,
         num_labels=1,
         torch_dtype=torch.float16 if script_args.fp16 else torch.bfloat16 if script_args.bf16 else None,
+        attn_implementation="sdpa",
         low_cpu_mem_usage=False,
     )
-
+    nn.init.zeros_(model.score.weight)
     print(model.config)
+
 
 
     tokenizer.model_max_length = script_args.max_length  # Use reduced max length
@@ -357,60 +448,102 @@ if __name__ == "__main__":
     model.config.pad_token_id = tokenizer.pad_token_id
     model.resize_token_embeddings(len(tokenizer))
 
-
     model = model
 
     output_name = script_args.output_path
 
-    def build_dataset(tokenizer, train_size: int = 10000, eval_size: int = 2000):
-        def tokenize(sample):
-   
-            raw_chosen   = sample["chosen"][-1]  if isinstance(sample["chosen"],  (list, tuple)) else sample["chosen"]
-            raw_rejected = sample["rejected"][-1] if isinstance(sample["rejected"], (list, tuple)) else sample["rejected"]
+    def build_dataset(tokenizer, train_size=25000, eval_size=1000):
+        def to_texts(ex):
+            # ex["chosen"] / ex["rejected"] are already lists of {"role","content"}
+            txt_j = tokenizer.apply_chat_template(
+                ex["chosen"], tokenize=False, add_generation_prompt=False
+            )
+            txt_k = tokenizer.apply_chat_template(
+                ex["rejected"], tokenize=False, add_generation_prompt=False
+            )
 
+            tok_j = tokenizer(txt_j, truncation=True)
+            tok_k = tokenizer(txt_k, truncation=True)
 
-            text_j = raw_chosen["content"]   if isinstance(raw_chosen, dict)  else raw_chosen
-            text_k = raw_rejected["content"] if isinstance(raw_rejected, dict) else raw_rejected
-
-
-            tok_j = tokenizer(text_j, truncation=True, max_length=script_args.max_length)
-            tok_k = tokenizer(text_k, truncation=True, max_length=script_args.max_length)
-
-  
             return {
                 "input_ids_j":      tok_j["input_ids"],
                 "attention_mask_j": tok_j["attention_mask"],
                 "input_ids_k":      tok_k["input_ids"],
                 "attention_mask_k": tok_k["attention_mask"],
-                "text_j":           text_j,
-                "text_k":           text_k,
-                "category":         sample["category"],
+                "text_j":           txt_j,
+                "text_k":           txt_k,
+                "category":         ex["category"],
             }
 
-        ds = load_hh_rlhf_with_category()
-
-        print(ds[0])
-        print() 
-        print(ds[1])
-
-
-        original_columns = ds.column_names
-
-        # train 
-        ds = ds.map(
-            tokenize,
-            num_proc=4, 
-            remove_columns=original_columns,
-        )
-
-        # eval
+        keep = {"input_ids_j","attention_mask_j","input_ids_k","attention_mask_k","text_j","text_k","category"}
+        ds_all = load_hh_rlhf_with_category()
+        ds = ds_all.map(to_texts, remove_columns=[c for c in ds_all.column_names if c not in keep])
+        #ds = ds_all.map(to_texts, remove_columns=[c for c in ds_all.column_names if c not in {"text_j","text_k","category"}])
         ds = ds.shuffle(seed=42)
-        train_dataset = ds.select(range(train_size))
-        eval_dataset  = ds.select(range(train_size, train_size + eval_size))
-
+        train_dataset = ds.select(range(min(train_size, len(ds))))
+        eval_dataset  = ds.select(range(min(train_size, len(ds)), min(train_size+eval_size, len(ds))))
         return train_dataset, eval_dataset
 
-    train_dataset, eval_dataset = build_dataset(tokenizer, train_size=25000, eval_size=1000)
+    # def build_dataset(tokenizer, train_size: int = 10000, eval_size: int = 2000):
+
+    #     def tokenize(sample):        
+    #         raw_chosen   = sample["chosen"][-1]  if isinstance(sample["chosen"],  (list, tuple)) else sample["chosen"]
+    #         raw_rejected = sample["rejected"][-1] if isinstance(sample["rejected"], (list, tuple)) else sample["rejected"]
+
+    #         # llama 3 sft specific -- add chat template
+    #         if tokenizer.bos_token:
+    #             raw_chosen = tokenizer.apply_chat_template(
+    #                 raw_chosen, tokenize=False, add_generation_prompt=False
+    #             ).replace(tokenizer.bos_token, "")
+    #             raw_rejected = tokenizer.apply_chat_template(
+    #                 raw_rejected, tokenize=False, add_generation_prompt=False
+    #             ).replace(tokenizer.bos_token, "")
+    #         else:
+    #             raw_chosen = tokenizer.apply_chat_template(
+    #                 raw_chosen, tokenize=False, add_generation_prompt=False
+    #             )
+    #             raw_rejected = tokenizer.apply_chat_template(
+    #                 raw_rejected, tokenize=False, add_generation_prompt=False
+    #             )
+
+
+    #         text_j = raw_chosen["content"]   if isinstance(raw_chosen, dict)  else raw_chosen
+    #         text_k = raw_rejected["content"] if isinstance(raw_rejected, dict) else raw_rejected
+
+
+    #         tok_j = tokenizer(text_j, truncation=True, max_length=script_args.max_length)
+    #         tok_k = tokenizer(text_k, truncation=True, max_length=script_args.max_length)
+
+  
+    #         return {
+    #             "input_ids_j":      tok_j["input_ids"],
+    #             "attention_mask_j": tok_j["attention_mask"],
+    #             "input_ids_k":      tok_k["input_ids"],
+    #             "attention_mask_k": tok_k["attention_mask"],
+    #             "text_j":           text_j,
+    #             "text_k":           text_k,
+    #             "category":         sample["category"],
+    #         }
+
+    #     ds = load_hh_rlhf_with_category()
+
+    #     original_columns = ds.column_names
+
+    #     # train 
+    #     ds = ds.map(
+    #         tokenize,
+    #         num_proc=4, 
+    #         remove_columns=original_columns,
+    #     )
+
+    #     # eval
+    #     ds = ds.shuffle(seed=42)
+    #     train_dataset = ds.select(range(train_size))
+    #     eval_dataset  = ds.select(range(train_size, train_size + eval_size))
+
+    #     return train_dataset, eval_dataset
+
+    train_dataset, eval_dataset = build_dataset(tokenizer, train_size=75000, eval_size=1000)
 
     training_args = TrainingArguments(
         output_dir=output_name,
@@ -450,10 +583,7 @@ if __name__ == "__main__":
     from transformers.tokenization_utils_base import PaddingStrategy
     import torch
 
-    
-        
-
-
+    # We need to define a special data collator that batches the data in our j vs k format.
     @dataclass
     class RewardDataCollatorWithPadding:
         tokenizer: AutoTokenizer
@@ -463,38 +593,82 @@ if __name__ == "__main__":
         return_tensors: str = "pt"
 
         def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-            #print(features)
-            categories = [f["category"] for f in features]
-            # 1) Extract texts
+            merged_features = []
             texts_j = [f["text_j"] for f in features]
             texts_k = [f["text_k"] for f in features]
+            categories = [f["category"] for f in features]
 
- 
-            interleaved = []
-            for j, k in zip(texts_j, texts_k):
-                interleaved.append(j)
-                interleaved.append(k)
-
-            batch = self.tokenizer(
-                interleaved,
+            for feature in features:
+                merged_features.append(
+                    {
+                        "input_ids": feature["input_ids_j"],
+                        "attention_mask": feature["attention_mask_j"],
+                        
+                    }
+                )
+                merged_features.append(
+                    {
+                        "input_ids": feature["input_ids_k"],
+                        "attention_mask": feature["attention_mask_k"],
+                    }
+                )
+            batch = self.tokenizer.pad(
+                merged_features,
                 padding=self.padding,
-                truncation=True,
-                max_length=self.max_length or self.tokenizer.model_max_length,
+                max_length=self.max_length,
                 pad_to_multiple_of=self.pad_to_multiple_of,
                 return_tensors=self.return_tensors,
             )
-
-
-            return {
-                "input_ids":      batch["input_ids"],  
-                "attention_mask": batch["attention_mask"], # same shape
-                "return_loss":    True,
-                "texts_j":        texts_j,
-                "texts_k":        texts_k,
-                "category":       categories,
+            batch = {
+                "input_ids": batch["input_ids"],
+                "attention_mask": batch["attention_mask"],
+                "category": categories,
+                "texts_j": texts_j,
+                "texts_k": texts_k,
+                "return_loss": True,
             }
+            return batch
+            
 
 
+    # @dataclass
+    # class RewardDataCollatorWithPadding:
+    #     tokenizer: AutoTokenizer
+    #     padding: Union[bool, str, PaddingStrategy] = "longest"
+    #     max_length: Optional[int] = None
+    #     pad_to_multiple_of: Optional[int] = None
+    #     return_tensors: str = "pt"
+
+    #     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+    #         #print(features)
+    #         categories = [f["category"] for f in features]
+    #         # 1) Extract texts
+    #         texts_j = [f["text_j"] for f in features]
+    #         texts_k = [f["text_k"] for f in features]
+
+ 
+    #         interleaved = []
+    #         for j, k in zip(texts_j, texts_k):
+    #             interleaved.append(j)
+    #             interleaved.append(k)
+
+    #         batch = self.tokenizer.pad(
+    #             interleaved,
+    #             padding=self.padding,
+    #             max_length=self.max_length or self.tokenizer.model_max_length,
+    #             pad_to_multiple_of=self.pad_to_multiple_of,
+    #             return_tensors=self.return_tensors,
+    #         )
+
+
+    #         return {
+    #             "input_ids":      batch["input_ids"],  
+    #             "attention_mask": batch["attention_mask"], # same shape
+    #             "return_loss":    True,
+    #             "texts_j":        texts_j,
+    #             "texts_k":        texts_k,
+    #             "category":       categories,
+    #         }
 
     def compute_metrics(eval_pred):
         result = {}
@@ -508,10 +682,6 @@ if __name__ == "__main__":
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-
-
-    
-
 
     trainer = RewardTrainer(
         model=model,
@@ -529,15 +699,14 @@ if __name__ == "__main__":
     batch = next(iter(dl))
     print("Got batch with shape", batch["input_ids"].shape)
 
-
     print("Starting reward-model training…")
     if dist.is_initialized():
         print(f"[Rank {dist.get_rank()}] Before barrier", flush=True)
 
         dist.barrier()
         print(f"[Rank {dist.get_rank()}] After barrier", flush=True)
-    trainer.train()
 
+    trainer.train()
 
     print("Saving last checkpoint of the model")
     #torch.distributed.barrier()
@@ -553,10 +722,10 @@ if __name__ == "__main__":
     from datasets import load_dataset
     plt.ioff()
 
+    @torch.inference_mode()
     def get_reward_score(text: str) -> float:
         enc = tokenizer(
             text,
-            truncation=True,
             padding="longest",
             max_length=tokenizer.model_max_length,
             return_tensors="pt",
